@@ -40,11 +40,30 @@ const pool = new Pool({
 const sessions = new Map();
 const SESSION_MS = 12 * 60 * 60 * 1000;
 const TABLE_KEYS = ['zones', 'pops', 'olts', 'ports', 'firstSplitters', 'secondSplitters', 'clients'];
+const REQUIRED_STATE_KEYS = ['users', 'zones', 'pops', 'olts', 'ports', 'firstSplitters', 'secondSplitters', 'clients'];
+const STATE_TO_TABLE = { zones: 'zones', pops: 'pops', olts: 'olts', ports: 'ports', firstSplitters: 'first_splitters', secondSplitters: 'second_splitters', clients: 'clients' };
 
 const emptyState = () => ({
   users: [], zones: [], pops: [], olts: [], ports: [],
   firstSplitters: [], secondSplitters: [], clients: []
 });
+
+function validateStatePayload(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return 'Request body must be a complete state object';
+  }
+  for (const key of REQUIRED_STATE_KEYS) {
+    const value = key === 'firstSplitters'
+      ? (input.firstSplitters ?? input.first_splitters)
+      : key === 'secondSplitters'
+        ? (input.secondSplitters ?? input.second_splitters)
+        : input[key];
+    if (!Array.isArray(value)) {
+      return `Incomplete state: "${key}" must be an array. Nothing was saved.`;
+    }
+  }
+  return null;
+}
 
 function normalizeState(input = {}) {
   return {
@@ -287,7 +306,7 @@ async function syncAppUsersFromState(state) {
 }
 
 
-async function syncLegacyTable(table, key, items, client) {
+async function syncLegacyTable(table, key, items, client, allowEmptyDeletion = false) {
   if (!(await tableExists(client, table))) return;
 
   // The legacy tables in this project use an id + data JSONB shape.
@@ -305,7 +324,9 @@ async function syncLegacyTable(table, key, items, client) {
   // Delete rows that no longer exist in the application state so the
   // normalized tables stay an exact mirror of carnival_state.
   if (!items.length) {
-    await client.query(`DELETE FROM public.${table}`);
+    // Empty collections are destructive. Only clear a legacy table after the
+    // client explicitly confirmed a transition from non-empty to empty.
+    if (allowEmptyDeletion) await client.query(`DELETE FROM public.${table}`);
     return;
   }
 
@@ -361,7 +382,7 @@ async function syncLegacyTable(table, key, items, client) {
   await client.query(`DELETE FROM public.${table} WHERE id <> ALL($1::text[])`, [ids]);
 }
 
-async function syncNormalizedTables(state) {
+async function syncNormalizedTables(state, confirmedEmptyKeys = new Set()) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -375,7 +396,7 @@ async function syncNormalizedTables(state) {
       ['clients','clients'],
     ];
     for (const [table,key] of mappings) {
-      await syncLegacyTable(table, key, Array.isArray(state[key]) ? state[key] : [], client);
+      await syncLegacyTable(table, key, Array.isArray(state[key]) ? state[key] : [], client, confirmedEmptyKeys.has(key));
     }
     await client.query('COMMIT');
   } catch (e) {
@@ -386,11 +407,11 @@ async function syncNormalizedTables(state) {
   }
 }
 
-async function syncState(state, user) {
+async function syncState(state, user, confirmedEmptyKeys = new Set()) {
   const normalized = normalizeState(state);
   if (user.role !== 'admin') { const old = await readState(); normalized.users = old.users; }
   await writeState(normalized);
-  await syncNormalizedTables(normalized);
+  await syncNormalizedTables(normalized, confirmedEmptyKeys);
   if (user.role === 'admin') await syncAppUsersFromState(normalized);
   const users = await pool.query('SELECT id,username,role,permissions FROM public.app_users ORDER BY username');
   normalized.users = users.rows.map(u => ({ id:u.id,username:u.username,role:u.role, ...(u.permissions ? {permissions:u.permissions} : {}) }));
@@ -450,8 +471,30 @@ app.get('/api/state',auth,async (req,res) => {
 
 app.put('/api/state',auth,requireRole('admin','manager','installer'),async (req,res) => {
   try {
-    const state = normalizeState(req.body || {});
-    const saved = await syncState(state,req.user);
+    const validationError = validateStatePayload(req.body);
+    if (validationError) return res.status(400).json({ok:false,error:validationError});
+
+    const confirmEmptyCollections = req.body.confirmEmptyCollections === true;
+    const rawState = { ...req.body };
+    delete rawState.confirmEmptyCollections;
+    const state = normalizeState(rawState);
+    const current = await readState();
+    const emptyingKeys = REQUIRED_STATE_KEYS.filter(key =>
+      Array.isArray(current[key]) && current[key].length > 0 && state[key].length === 0
+    );
+
+    // Do not let a transient/partial frontend state erase a populated collection.
+    // The frontend must show a confirmation before it can send this explicit flag.
+    if (emptyingKeys.length && !confirmEmptyCollections) {
+      return res.status(409).json({
+        ok:false,
+        error:`Safety check blocked clearing populated data: ${emptyingKeys.join(', ')}. Confirm the clear action in the app and try again.`,
+        requiresEmptyConfirmation:true,
+        collections:emptyingKeys
+      });
+    }
+    const confirmedEmptyKeys = new Set(emptyingKeys.filter(key => confirmEmptyCollections));
+    const saved = await syncState(state,req.user,confirmedEmptyKeys);
     res.json({ok:true,state:cleanStateForClient(saved)});
   } catch (e) {
     console.error('State write failed:',e);
