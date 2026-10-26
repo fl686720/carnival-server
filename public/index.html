@@ -124,6 +124,30 @@ I.useEffect(()=>{
     firstSplitters:baseline.firstSplitters||[],secondSplitters:baseline.secondSplitters||[],clients:baseline.clients||[]
   }:null;
   const baselineJson=baselineState?JSON.stringify(baselineState):null;
+  const stateKeys=["users","zones","pops","olts","ports","firstSplitters","secondSplitters","clients"];
+  const emptyingKeys=baselineState?stateKeys.filter(k=>(baselineState[k]||[]).length>0&&(state[k]||[]).length===0):[];
+  let confirmEmptyCollections=false;
+  if(emptyingKeys.length){
+    const labels={users:"users",zones:"zones",pops:"POPs",olts:"OLTs",ports:"ports",firstSplitters:"first splitters",secondSplitters:"second splitters",clients:"clients"};
+    const list=emptyingKeys.map(k=>labels[k]||k).join(", ");
+    const confirmed=window.confirm("Safety check: this change will clear all remaining records in: "+list+".\n\nChoose OK only if you intentionally deleted the last record(s). Choose Cancel to restore the server data.");
+    if(!confirmed){
+      window.__carnivalApplyingServerState=true;
+      const setters=window.__reactSetters__||{};
+      if(setters.setUsers)setters.setUsers(baselineState.users||[]);
+      if(setters.setZones)setters.setZones(baselineState.zones||[]);
+      if(setters.setPops)setters.setPops(baselineState.pops||[]);
+      if(setters.setOlts)setters.setOlts(baselineState.olts||[]);
+      if(setters.setPorts)setters.setPorts(baselineState.ports||[]);
+      if(setters.setFirst)setters.setFirst(baselineState.firstSplitters||[]);
+      if(setters.setSecond)setters.setSecond(baselineState.secondSplitters||[]);
+      if(setters.setClients)setters.setClients(baselineState.clients||[]);
+      window.__carnivalStateDirty=false;
+      setTimeout(()=>{window.__carnivalApplyingServerState=false;},0);
+      return;
+    }
+    confirmEmptyCollections=true;
+  }
 
   if(currentJson===baselineJson){
     window.__carnivalStateDirty=false;
@@ -139,7 +163,7 @@ I.useEffect(()=>{
       const rr=await fetch("/api/state",{
         method:"PUT",
         headers:{"Content-Type":"application/json","Authorization":"Bearer "+tk},
-        body:currentJson,
+        body:JSON.stringify({...state,confirmEmptyCollections}),
         cache:"no-store"
       });
       let dd={};
@@ -152,6 +176,10 @@ I.useEffect(()=>{
       }
       if(!rr.ok){
         console.error("CARNIVAL V45: backend state save failed",dd);
+        if(dd&&dd.requiresEmptyConfirmation){
+          alert("Save blocked to protect your data. Please reload the app to restore the latest server data, then retry the intended change.");
+          window.__carnivalStateDirty=false;
+        }
         return;
       }
       window.__carnivalLastServerState=dd.state||state;
